@@ -85,6 +85,12 @@ func (c cfClient) request(method, path string, body any, out any) error {
 		return fmt.Errorf("Cloudflare HTTP %d: invalid response: %w", resp.StatusCode, err)
 	}
 	if !decoded.Success || resp.StatusCode >= 400 {
+		if resp.StatusCode == http.StatusUnauthorized {
+			return errors.New("Cloudflare 拒絕 API Token (401)：請確認填的是 My Profile → API Tokens 建立時顯示的 Token secret，不是 cloudflared 安裝指令中的 eyJ... Tunnel token；也請確認 Token 仍有效")
+		}
+		if resp.StatusCode == http.StatusForbidden {
+			return errors.New("Cloudflare 拒絕權限 (403)：請確認 API Token 具備 Account / Cloudflare Tunnel / Edit 與 ddman.cc 的 Zone / DNS / Edit")
+		}
 		messages := make([]string, 0, len(decoded.Errors))
 		for _, item := range decoded.Errors {
 			messages = append(messages, fmt.Sprintf("%d: %s", item.Code, item.Message))
@@ -105,6 +111,12 @@ func (a *App) setupCloudflare(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validID.MatchString(input.AccountID) || !validID.MatchString(input.ZoneID) || strings.TrimSpace(input.APIToken) == "" {
 		http.Error(w, "enter valid Account ID, Zone ID, and API Token", http.StatusBadRequest)
+		return
+	}
+	input.APIToken = strings.TrimSpace(input.APIToken)
+	input.APIToken = strings.TrimPrefix(input.APIToken, "Bearer ")
+	if strings.HasPrefix(input.APIToken, "eyJ") || strings.Contains(input.APIToken, "cloudflared") {
+		http.Error(w, "這是 Tunnel token 或安裝指令；API Token 請從 Cloudflare 的 My Profile → API Tokens 建立並複製", http.StatusBadRequest)
 		return
 	}
 	if input.ExistingTunnelID != "" && !validTunnelID.MatchString(input.ExistingTunnelID) {

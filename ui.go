@@ -33,7 +33,7 @@ const indexHTML = `<!doctype html>
     <form id="cloudflare-form">
       <label>Account ID<input name="accountId" required autocomplete="off" placeholder="ddman.cc Overview → API"></label>
       <label>Zone ID<input name="zoneId" required autocomplete="off" placeholder="ddman.cc Overview → API"></label>
-      <label>API Token<input name="apiToken" required type="password" autocomplete="off" placeholder="My Profile → API Tokens"></label>
+      <label>API Token<input name="apiToken" required type="password" autocomplete="off" placeholder="My Profile → API Tokens 的 Token secret"></label>
       <label>現有 Tunnel ID（選填）<input name="existingTunnelId" autocomplete="off" placeholder="截圖中的通道 ID"></label>
       <button>設定並連線</button>
     </form>

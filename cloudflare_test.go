@@ -3,6 +3,7 @@ package main
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -98,5 +99,19 @@ func TestCloudflareSetupImportsEmptyTunnel(t *testing.T) {
 	}
 	if createdTunnel || app.config.Cloudflare.TunnelID != tunnel {
 		t.Fatal("existing tunnel was not reused")
+	}
+}
+
+func TestCloudflareRejectsTunnelTokenInAPIField(t *testing.T) {
+	app, err := loadConfig(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest("POST", "http://127.0.0.1:8787/api/cloudflare/setup", strings.NewReader(`{"accountId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","zoneId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","apiToken":"eyJfake-tunnel-token"}`))
+	request.Header.Set("Origin", "http://127.0.0.1:8787")
+	response := httptest.NewRecorder()
+	app.adminHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "Tunnel token") {
+		t.Fatalf("got %d %s", response.Code, response.Body.String())
 	}
 }
