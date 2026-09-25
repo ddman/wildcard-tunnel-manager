@@ -1,0 +1,67 @@
+package main
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestRouteProxyAndUnknownHost(t *testing.T) {
+	app := &App{config: Config{BaseDomain: "ddman.cc", Routes: []Route{{Name: "app", Scheme: "http", Port: 3000}}}}
+	app.proxyTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host != "127.0.0.1:3000" {
+			t.Errorf("wrong target: %s", r.URL.Host)
+		}
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(r.Host + " " + r.URL.Path))}, nil
+	})
+	for _, tc := range []struct {
+		host, path string
+		status     int
+		body       string
+	}{
+		{"app.ddman.cc", "/hello", 200, "app.ddman.cc /hello"},
+		{"missing.ddman.cc", "/", 404, "route not found"},
+		{"app.home.ddman.cc", "/", 404, "unknown hostname"},
+	} {
+		req := httptest.NewRequest("GET", "http://"+tc.host+tc.path, nil)
+		w := httptest.NewRecorder()
+		app.proxy(w, req)
+		if w.Code != tc.status || !strings.Contains(w.Body.String(), tc.body) {
+			t.Fatalf("host %s: got %d %q", tc.host, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestAdminRoutePersistenceAndSecretOmission(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	app, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.config.Cloudflare.TunnelToken = "secret"
+	h := app.adminHandler()
+	req := httptest.NewRequest("POST", "http://127.0.0.1:8787/api/routes", strings.NewReader(`{"name":"demo","scheme":"http","port":3000}`))
+	req.Header.Set("Origin", "http://127.0.0.1:8787")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != 201 {
+		t.Fatalf("POST: %d %s", w.Code, w.Body.String())
+	}
+	loaded, err := loadConfig(path)
+	if err != nil || len(loaded.config.Routes) != 1 {
+		t.Fatalf("reload: %v", err)
+	}
+	req = httptest.NewRequest("GET", "http://127.0.0.1:8787/api/state", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if strings.Contains(w.Body.String(), "secret") {
+		t.Fatal("Tunnel token leaked in API")
+	}
+}
