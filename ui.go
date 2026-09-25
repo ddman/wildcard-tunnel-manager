@@ -12,20 +12,22 @@ const indexHTML = `<!doctype html>
 </head>
 <body>
   <h1>DDMAN Home Tunnel</h1>
-  <p>將 <code>名稱.ddman.cc</code> 對應到這台電腦上的 HTTP 或 HTTPS port。</p>
+  <p>將 <code>名稱.ddman.cc/路徑</code> 對應到這台電腦上的 HTTP 或 HTTPS port。相同子網域會由最長的路徑前綴優先處理。</p>
   <section>
     <h2>新增路由</h2>
     <form id="route-form">
       <label>子網域名稱<input name="name" required pattern="[a-z0-9]([a-z0-9-]*[a-z0-9])?" placeholder="app"></label>
+      <label>路徑前綴<input name="path" required value="/" pattern="/([A-Za-z0-9._~-]+(/[A-Za-z0-9._~-]+)*)?" placeholder="/api"></label>
       <label>協定<select name="scheme"><option>http</option><option>https</option></select></label>
       <label>本機 port<input name="port" required type="number" min="1" max="65535" placeholder="3000"></label>
+      <label>轉送路徑<select name="stripPrefix"><option value="false">保留前綴</option><option value="true">移除前綴</option></select></label>
       <button>新增</button>
     </form>
     <p id="message" role="status"></p>
   </section>
   <section>
     <h2>目前路由</h2>
-    <table><thead><tr><th>公開網址</th><th>本機服務</th><th></th></tr></thead><tbody id="routes"></tbody></table>
+    <table><thead><tr><th>公開網址</th><th>本機服務</th><th>轉送路徑</th><th></th></tr></thead><tbody id="routes"></tbody></table>
   </section>
   <section>
     <h2>Cloudflare 連線</h2>
@@ -43,8 +45,8 @@ const indexHTML = `<!doctype html>
   </section>
   <script>
     const rows=document.querySelector('#routes'),message=document.querySelector('#message');
-    async function load(){const state=await (await fetch('/api/state')).json();rows.replaceChildren();for(const route of state.routes){const tr=document.createElement('tr');const host=document.createElement('td');host.textContent=route.name+'.'+state.baseDomain;const target=document.createElement('td');target.textContent=route.scheme+'://127.0.0.1:'+route.port;const action=document.createElement('td');const button=document.createElement('button');button.className='delete';button.textContent='刪除';button.onclick=async()=>{const response=await fetch('/api/routes/'+encodeURIComponent(route.name),{method:'DELETE'});if(!response.ok){message.textContent=await response.text();return}await load()};action.append(button);tr.append(host,target,action);rows.append(tr)}const cf=state.cloudflare;document.querySelector('[name=accountId]').value=cf.accountId||'';document.querySelector('[name=zoneId]').value=cf.zoneId||'';document.querySelector('[name=existingTunnelId]').value=cf.tunnelId||'';document.querySelector('#cloudflare-status').textContent=cf.tunnelId?'Tunnel '+cf.tunnelId+(state.tunnelRunning?' 正在執行':' 尚未執行'):'尚未連線'}
-    document.querySelector('#route-form').onsubmit=async event=>{event.preventDefault();message.textContent='';const data=new FormData(event.target);const response=await fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:data.get('name'),scheme:data.get('scheme'),port:Number(data.get('port'))})});if(!response.ok){message.textContent=await response.text();return}event.target.reset();await load()};load().catch(error=>message.textContent=String(error));
+    async function load(){const state=await (await fetch('/api/state')).json();rows.replaceChildren();for(const route of state.routes){const tr=document.createElement('tr');const host=document.createElement('td');const path=route.path||'/';host.textContent='https://'+route.name+'.'+state.baseDomain+path;const target=document.createElement('td');target.textContent=route.scheme+'://127.0.0.1:'+route.port;const rewrite=document.createElement('td');rewrite.textContent=route.stripPrefix?'移除前綴':'保留前綴';const action=document.createElement('td');const button=document.createElement('button');button.className='delete';button.textContent='刪除';button.onclick=async()=>{const response=await fetch('/api/routes/'+encodeURIComponent(route.name)+'?path='+encodeURIComponent(path),{method:'DELETE'});if(!response.ok){message.textContent=await response.text();return}await load()};action.append(button);tr.append(host,target,rewrite,action);rows.append(tr)}const cf=state.cloudflare;document.querySelector('[name=accountId]').value=cf.accountId||'';document.querySelector('[name=zoneId]').value=cf.zoneId||'';document.querySelector('[name=existingTunnelId]').value=cf.tunnelId||'';document.querySelector('#cloudflare-status').textContent=cf.tunnelId?'Tunnel '+cf.tunnelId+(state.tunnelRunning?' 正在執行':' 尚未執行'):'尚未連線'}
+    document.querySelector('#route-form').onsubmit=async event=>{event.preventDefault();message.textContent='';const data=new FormData(event.target);const response=await fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:data.get('name'),path:data.get('path'),stripPrefix:data.get('stripPrefix')==='true',scheme:data.get('scheme'),port:Number(data.get('port'))})});if(!response.ok){message.textContent=await response.text();return}event.target.reset();await load()};load().catch(error=>message.textContent=String(error));
     document.querySelector('#cloudflare-form').onsubmit=async event=>{event.preventDefault();const status=document.querySelector('#cloudflare-status');status.textContent='設定中…';const data=new FormData(event.target);const response=await fetch('/api/cloudflare/setup',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.fromEntries(data))});const body=await response.text();status.textContent=response.ok?'Tunnel 與 DNS 已設定。請確認 HTTPS 憑證生效。':body;if(response.ok){event.target.querySelector('[name=apiToken]').value='';await load()}};
   </script>
 </body>

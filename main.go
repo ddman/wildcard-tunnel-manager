@@ -27,11 +27,14 @@ const (
 )
 
 var validLabel = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+var validPathPrefix = regexp.MustCompile(`^/(?:[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*)?$`)
 
 type Route struct {
-	Name   string `json:"name"`
-	Scheme string `json:"scheme"`
-	Port   int    `json:"port"`
+	Name        string `json:"name"`
+	Path        string `json:"path,omitempty"`
+	StripPrefix bool   `json:"stripPrefix,omitempty"`
+	Scheme      string `json:"scheme"`
+	Port        int    `json:"port"`
 }
 
 type Config struct {
@@ -126,7 +129,27 @@ func validateRoute(route Route) error {
 	if route.Port < 1 || route.Port > 65535 || route.Port == 8787 || route.Port == 8788 {
 		return fmt.Errorf("port must be 1-65535 and not an app port")
 	}
+	path := routePath(route)
+	if !validPathPrefix.MatchString(path) {
+		return fmt.Errorf("path must be / or a path prefix such as /api")
+	}
+	for _, segment := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
+		if segment == "." || segment == ".." {
+			return fmt.Errorf("path cannot contain . or .. segments")
+		}
+	}
 	return nil
+}
+
+func routePath(route Route) string {
+	if route.Path == "" {
+		return "/"
+	}
+	return route.Path
+}
+
+func pathMatchesPrefix(path, prefix string) bool {
+	return prefix == "/" || path == prefix || strings.HasPrefix(path, prefix+"/")
 }
 
 func (a *App) saveLocked() error {
@@ -162,11 +185,13 @@ func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 	}
 	a.mu.RLock()
 	var match *Route
+	longest := -1
 	for _, route := range a.config.Routes {
-		if route.Name == name {
+		prefix := routePath(route)
+		if route.Name == name && pathMatchesPrefix(r.URL.Path, prefix) && len(prefix) > longest {
 			copy := route
 			match = &copy
-			break
+			longest = len(prefix)
 		}
 	}
 	a.mu.RUnlock()
@@ -182,6 +207,14 @@ func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 	p.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 		log.Printf("proxy %s: %v", name, err)
 		http.Error(w, "local service unavailable", http.StatusBadGateway)
+	}
+	if match.StripPrefix && routePath(*match) != "/" {
+		r = r.Clone(r.Context())
+		r.URL.Path = strings.TrimPrefix(r.URL.Path, routePath(*match))
+		if r.URL.Path == "" {
+			r.URL.Path = "/"
+		}
+		r.URL.RawPath = ""
 	}
 	p.ServeHTTP(w, r)
 }
@@ -222,11 +255,14 @@ func (a *App) adminHandler() http.Handler {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		if route.Path == "" {
+			route.Path = "/"
+		}
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		for _, existing := range a.config.Routes {
-			if existing.Name == route.Name {
-				http.Error(w, "name already exists", http.StatusConflict)
+			if existing.Name == route.Name && routePath(existing) == route.Path {
+				http.Error(w, "hostname and path already exist", http.StatusConflict)
 				return
 			}
 		}
@@ -240,10 +276,14 @@ func (a *App) adminHandler() http.Handler {
 	})
 	mux.HandleFunc("DELETE /api/routes/{name}", func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
+		path := r.URL.Query().Get("path")
+		if path == "" {
+			path = "/"
+		}
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		for i, route := range a.config.Routes {
-			if route.Name == name {
+			if route.Name == name && routePath(route) == path {
 				old := a.config.Routes
 				a.config.Routes = append(append([]Route{}, old[:i]...), old[i+1:]...)
 				if err := a.saveLocked(); err != nil {
