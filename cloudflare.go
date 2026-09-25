@@ -17,6 +17,7 @@ import (
 )
 
 var validID = regexp.MustCompile(`^[a-fA-F0-9]{32}$`)
+var validTunnelID = regexp.MustCompile(`^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`)
 
 type CloudflareConfig struct {
 	AccountID   string `json:"accountId,omitempty"`
@@ -31,9 +32,10 @@ func (c CloudflareConfig) public() map[string]string {
 }
 
 type setupRequest struct {
-	AccountID string `json:"accountId"`
-	ZoneID    string `json:"zoneId"`
-	APIToken  string `json:"apiToken"`
+	AccountID        string `json:"accountId"`
+	ZoneID           string `json:"zoneId"`
+	APIToken         string `json:"apiToken"`
+	ExistingTunnelID string `json:"existingTunnelId"`
 }
 
 type cfResponse struct {
@@ -105,6 +107,10 @@ func (a *App) setupCloudflare(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "enter valid Account ID, Zone ID, and API Token", http.StatusBadRequest)
 		return
 	}
+	if input.ExistingTunnelID != "" && !validTunnelID.MatchString(input.ExistingTunnelID) {
+		http.Error(w, "existing Tunnel ID must be a UUID", http.StatusBadRequest)
+		return
+	}
 	if _, err := findCloudflared(); err != nil {
 		http.Error(w, "install cloudflared before setup: brew install cloudflared", http.StatusBadRequest)
 		return
@@ -116,6 +122,10 @@ func (a *App) setupCloudflare(w http.ResponseWriter, r *http.Request) {
 	a.mu.RUnlock()
 	if current.TunnelID != "" && (current.AccountID != input.AccountID || current.ZoneID != input.ZoneID) {
 		http.Error(w, "this app is already bound to another Cloudflare account or zone", http.StatusConflict)
+		return
+	}
+	if current.TunnelID != "" && input.ExistingTunnelID != "" && current.TunnelID != input.ExistingTunnelID {
+		http.Error(w, "this app is already bound to another Tunnel", http.StatusConflict)
 		return
 	}
 	client := cfClient{token: input.APIToken, http: &http.Client{Timeout: 20 * time.Second}}
@@ -134,6 +144,38 @@ func (a *App) configureCloudflare(client cfClient, input setupRequest) error {
 	a.mu.RLock()
 	current := a.config.Cloudflare
 	a.mu.RUnlock()
+	importing := current.TunnelID == "" && input.ExistingTunnelID != ""
+	if importing {
+		current.TunnelID = input.ExistingTunnelID
+		current.AccountID = input.AccountID
+		current.ZoneID = input.ZoneID
+		var tunnel struct {
+			ID        string `json:"id"`
+			ConfigSrc string `json:"config_src"`
+		}
+		base := "/accounts/" + input.AccountID + "/cfd_tunnel/" + current.TunnelID
+		if err := client.request(http.MethodGet, base, nil, &tunnel); err != nil {
+			return fmt.Errorf("inspect existing Tunnel: %w", err)
+		}
+		if tunnel.ID != current.TunnelID || tunnel.ConfigSrc != "cloudflare" {
+			return errors.New("existing Tunnel must be remotely managed and belong to this account")
+		}
+		var configuration struct {
+			Config struct {
+				Ingress []struct {
+					Service string `json:"service"`
+				} `json:"ingress"`
+			} `json:"config"`
+		}
+		if err := client.request(http.MethodGet, base+"/configurations", nil, &configuration); err != nil {
+			return fmt.Errorf("inspect existing Tunnel routes: %w", err)
+		}
+		for _, ingress := range configuration.Config.Ingress {
+			if ingress.Service != "http_status:404" {
+				return errors.New("existing Tunnel already has routes; refusing to replace them")
+			}
+		}
+	}
 	var records []struct {
 		ID      string `json:"id"`
 		Type    string `json:"type"`
@@ -152,6 +194,11 @@ func (a *App) configureCloudflare(client cfClient, input setupRequest) error {
 			return fmt.Errorf("*.ddman.cc already has a DNS record; refusing to replace it")
 		}
 		current.DNSRecordID = record.ID
+	}
+	if importing {
+		if err := a.persistCloudflare(current); err != nil {
+			return err
+		}
 	}
 	if current.TunnelID == "" {
 		var tunnel struct {
