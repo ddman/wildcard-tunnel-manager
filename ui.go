@@ -38,7 +38,7 @@ const indexHTML = `<!doctype html>
       <button>設定並連線</button>
     </form>
     <p id="cloudflare-status" role="status"></p>
-    <small>截圖中的「通道名稱」只用來辨識，不填在這裡；「通道 ID」填入選填欄位。安裝指令包含 Tunnel token，不要貼到 API Token 欄位，也不用執行。API Keys 區的 Global API Key 也不能填在這裡。API Token 需有 Account → Cloudflare Tunnel → Edit 與 ddman.cc 的 Zone → DNS → Edit。API Token 不會儲存；Tunnel token 會存於本機 config.json（權限 0600）。</small>
+    <small>截圖中的「通道名稱」只用來辨識，不填在這裡；「通道 ID」填入選填欄位。安裝指令包含 Tunnel token，不要貼到 API Token 欄位，也不用執行。API Keys 區的 Global API Key 也不能填在這裡。API Token 需有 Account → Cloudflare Tunnel → Edit 與 ddman.cc 的 Zone → DNS → Edit（DNS Write）；「DNS 設定：編輯」是另一種權限，不能管理 DNS 紀錄。API Token 不會儲存；Tunnel token 會存於本機 config.json（權限 0600）。</small>
     <p>本機代理位址：<code>http://127.0.0.1:8788</code>。可用 <code>curl -H 'Host: app.ddman.cc' http://127.0.0.1:8788</code> 測試。</p>
   </section>
   <script>

@@ -89,7 +89,10 @@ func (c cfClient) request(method, path string, body any, out any) error {
 			return errors.New("Cloudflare 拒絕 API Token (401)：請確認填的是 My Profile → API Tokens 建立時顯示的 Token secret，不是 cloudflared 安裝指令中的 eyJ... Tunnel token；也請確認 Token 仍有效")
 		}
 		if resp.StatusCode == http.StatusForbidden {
-			return errors.New("Cloudflare 拒絕權限 (403)：請確認 API Token 具備 Account / Cloudflare Tunnel / Edit 與 ddman.cc 的 Zone / DNS / Edit")
+			if strings.Contains(path, "/dns_records") {
+				return errors.New("Cloudflare 拒絕 DNS 紀錄權限 (403)：請在 API Token 加入 ddman.cc 的 Zone → DNS → Edit（DNS Write），不是 Zone → DNS Settings → Edit（DNS 設定：編輯）；並確認 Zone ID 正確")
+			}
+			return errors.New("Cloudflare 拒絕 Tunnel 權限 (403)：請確認 API Token 具備 Account → Cloudflare Tunnel → Edit，且 Account ID 正確")
 		}
 		messages := make([]string, 0, len(decoded.Errors))
 		for _, item := range decoded.Errors {
