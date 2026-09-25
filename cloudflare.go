@@ -119,6 +119,10 @@ func (a *App) setupCloudflare(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "這是 Tunnel token 或安裝指令；API Token 請從 Cloudflare 的 My Profile → API Tokens 建立並複製", http.StatusBadRequest)
 		return
 	}
+	if strings.HasPrefix(input.APIToken, "cfk_") {
+		http.Error(w, "這是 Global API Key，不是 API Token；請在 My Profile → API Tokens → Create Token 建立 Custom Token", http.StatusBadRequest)
+		return
+	}
 	if input.ExistingTunnelID != "" && !validTunnelID.MatchString(input.ExistingTunnelID) {
 		http.Error(w, "existing Tunnel ID must be a UUID", http.StatusBadRequest)
 		return
