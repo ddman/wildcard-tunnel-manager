@@ -3,11 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,15 +23,18 @@ var validID = regexp.MustCompile(`^[a-fA-F0-9]{32}$`)
 var validTunnelID = regexp.MustCompile(`^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`)
 
 type CloudflareConfig struct {
-	AccountID   string `json:"accountId,omitempty"`
-	ZoneID      string `json:"zoneId,omitempty"`
-	TunnelID    string `json:"tunnelId,omitempty"`
-	DNSRecordID string `json:"dnsRecordId,omitempty"`
-	TunnelToken string `json:"tunnelToken,omitempty"`
+	AccountID     string `json:"accountId,omitempty"`
+	ZoneID        string `json:"zoneId,omitempty"`
+	TunnelID      string `json:"tunnelId,omitempty"`
+	DNSRecordID   string `json:"dnsRecordId,omitempty"`
+	TunnelToken   string `json:"tunnelToken,omitempty"`
+	SocketIngress bool   `json:"socketIngress,omitempty"`
+	AdminHostname string `json:"adminHostname,omitempty"`
+	AdminService  string `json:"adminService,omitempty"`
 }
 
 func (c CloudflareConfig) public() map[string]string {
-	return map[string]string{"accountId": c.AccountID, "zoneId": c.ZoneID, "tunnelId": c.TunnelID, "dnsRecordId": c.DNSRecordID}
+	return map[string]string{"accountId": c.AccountID, "zoneId": c.ZoneID, "tunnelId": c.TunnelID, "dnsRecordId": c.DNSRecordID, "adminHostname": c.AdminHostname, "adminService": c.AdminService}
 }
 
 type setupRequest struct {
@@ -36,6 +42,13 @@ type setupRequest struct {
 	ZoneID           string `json:"zoneId"`
 	APIToken         string `json:"apiToken"`
 	ExistingTunnelID string `json:"existingTunnelId"`
+	Force            bool   `json:"force"`
+}
+
+type BindingConflictError struct{ Hostname, OwnerTunnelID string }
+
+func (e *BindingConflictError) Error() string {
+	return fmt.Sprintf("%s 已由另一條 Tunnel（%s）綁定；如要接管，請確認後使用強制綁定", e.Hostname, e.OwnerTunnelID)
 }
 
 type cfResponse struct {
@@ -90,7 +103,7 @@ func (c cfClient) request(method, path string, body any, out any) error {
 		}
 		if resp.StatusCode == http.StatusForbidden {
 			if strings.Contains(path, "/dns_records") {
-				return errors.New("Cloudflare 拒絕 DNS 紀錄權限 (403)：請在 API Token 加入 ddman.cc 的 Zone → DNS → Edit（DNS Write），不是 Zone → DNS Settings → Edit（DNS 設定：編輯）；並確認 Zone ID 正確")
+				return errors.New("Cloudflare 拒絕 DNS 紀錄權限 (403)：請在 API Token 加入目前網域的 Zone → DNS → Edit（DNS Write），不是 Zone → DNS Settings → Edit（DNS 設定：編輯）；並確認 Zone ID 正確")
 			}
 			return errors.New("Cloudflare 拒絕 Tunnel 權限 (403)：請確認 API Token 具備 Account → Cloudflare Tunnel → Edit，且 Account ID 正確")
 		}
@@ -112,12 +125,27 @@ func (a *App) setupCloudflare(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
+	a.mu.RLock()
+	if input.AccountID == "" {
+		input.AccountID = a.cfAccountID
+	}
+	if input.ZoneID == "" {
+		input.ZoneID = a.cfZoneID
+	}
+	if input.APIToken == "" {
+		input.APIToken = a.cfAPIToken
+	}
+	a.mu.RUnlock()
 	if !validID.MatchString(input.AccountID) || !validID.MatchString(input.ZoneID) || strings.TrimSpace(input.APIToken) == "" {
 		http.Error(w, "enter valid Account ID, Zone ID, and API Token", http.StatusBadRequest)
 		return
 	}
 	input.APIToken = strings.TrimSpace(input.APIToken)
 	input.APIToken = strings.TrimPrefix(input.APIToken, "Bearer ")
+	if len(input.APIToken) > 4096 || strings.ContainsAny(input.APIToken, "\r\n") {
+		http.Error(w, "invalid API Token", http.StatusBadRequest)
+		return
+	}
 	if strings.HasPrefix(input.APIToken, "eyJ") || strings.Contains(input.APIToken, "cloudflared") {
 		http.Error(w, "這是 Tunnel token 或安裝指令；API Token 請從 Cloudflare 的 My Profile → API Tokens 建立並複製", http.StatusBadRequest)
 		return
@@ -147,21 +175,51 @@ func (a *App) setupCloudflare(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "this app is already bound to another Tunnel", http.StatusConflict)
 		return
 	}
+	if err := saveCFSettings(filepath.Join(filepath.Dir(a.path), ".env"), input.AccountID, input.ZoneID, input.APIToken); err != nil {
+		http.Error(w, "could not save Cloudflare settings", http.StatusInternalServerError)
+		return
+	}
+	a.mu.Lock()
+	a.cfAccountID, a.cfZoneID, a.cfAPIToken = input.AccountID, input.ZoneID, input.APIToken
+	a.mu.Unlock()
+	log.Printf("Cloudflare setup request started")
 	client := cfClient{token: input.APIToken, http: &http.Client{Timeout: 20 * time.Second}}
 	if err := a.configureCloudflare(client, input); err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		log.Printf("Cloudflare setup request failed")
+		a.refreshBindingHealth()
+		var conflict *BindingConflictError
+		if errors.As(err, &conflict) {
+			http.Error(w, err.Error(), http.StatusConflict)
+		} else {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+		}
 		return
 	}
 	if err := a.startTunnel(); err != nil {
 		http.Error(w, "Cloudflare configured, but cloudflared could not start: "+err.Error(), http.StatusBadGateway)
 		return
 	}
+	if a.legacyProxy != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := a.legacyProxy.Shutdown(ctx); err != nil {
+				log.Printf("stop legacy proxy: %v", err)
+			}
+		}()
+	}
+	log.Printf("Cloudflare setup updated socket ingress")
+	a.refreshBindingHealth()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (a *App) configureCloudflare(client cfClient, input setupRequest) error {
+	if a.adminAuth == nil {
+		return errors.New("admin login is not configured")
+	}
 	a.mu.RLock()
 	current := a.config.Cloudflare
+	wildcardHostname := "*." + a.config.BaseDomain
 	a.mu.RUnlock()
 	importing := current.TunnelID == "" && input.ExistingTunnelID != ""
 	if importing {
@@ -202,15 +260,23 @@ func (a *App) configureCloudflare(client cfClient, input setupRequest) error {
 		Content string `json:"content"`
 		Proxied bool   `json:"proxied"`
 	}
-	if err := client.request(http.MethodGet, "/zones/"+input.ZoneID+"/dns_records?name=%2A.ddman.cc&per_page=100", nil, &records); err != nil {
+	var wildcardNeedsPatch bool
+	current.DNSRecordID = ""
+	if err := client.request(http.MethodGet, "/zones/"+input.ZoneID+"/dns_records?name="+url.QueryEscape(wildcardHostname)+"&per_page=100", nil, &records); err != nil {
 		return fmt.Errorf("check wildcard DNS: %w", err)
 	}
 	for _, record := range records {
-		if record.Name != "*.ddman.cc" {
+		if record.Name != wildcardHostname {
 			continue
 		}
-		if current.TunnelID == "" || record.Type != "CNAME" || record.Content != current.TunnelID+".cfargotunnel.com" || !record.Proxied {
-			return fmt.Errorf("*.ddman.cc already has a DNS record; refusing to replace it")
+		if record.Type != "CNAME" || !record.Proxied || !validTunnelDNSContent(record.Content) {
+			return fmt.Errorf("%s already has a non-Tunnel DNS record; refusing to replace it", wildcardHostname)
+		}
+		if record.Content != current.TunnelID+".cfargotunnel.com" {
+			if !input.Force {
+				return &BindingConflictError{Hostname: wildcardHostname, OwnerTunnelID: strings.TrimSuffix(record.Content, ".cfargotunnel.com")}
+			}
+			wildcardNeedsPatch = true
 		}
 		current.DNSRecordID = record.ID
 	}
@@ -223,7 +289,11 @@ func (a *App) configureCloudflare(client cfClient, input setupRequest) error {
 		var tunnel struct {
 			ID string `json:"id"`
 		}
-		body := map[string]string{"name": "ddman-home-tunnel", "config_src": "cloudflare"}
+		idSuffix := make([]byte, 6)
+		if _, err := rand.Read(idSuffix); err != nil {
+			return err
+		}
+		body := map[string]string{"name": fmt.Sprintf("wildcard-tunnel-manager-%x", idSuffix), "config_src": "cloudflare"}
 		if err := client.request(http.MethodPost, "/accounts/"+input.AccountID+"/cfd_tunnel", body, &tunnel); err != nil {
 			return fmt.Errorf("create Tunnel: %w", err)
 		}
@@ -245,18 +315,21 @@ func (a *App) configureCloudflare(client cfClient, input setupRequest) error {
 	if err := a.persistCloudflare(current); err != nil {
 		return err
 	}
-	config := map[string]any{"config": map[string]any{"ingress": []map[string]string{
-		{"hostname": "*.ddman.cc", "service": "http://127.0.0.1:8788"},
-		{"service": "http_status:404"},
-	}}}
+	config := tunnelIngressConfig(wildcardHostname, a.proxySocket)
 	if err := client.request(http.MethodPut, "/accounts/"+input.AccountID+"/cfd_tunnel/"+current.TunnelID+"/configurations", config, nil); err != nil {
 		return fmt.Errorf("configure Tunnel ingress: %w", err)
+	}
+	current.SocketIngress = true
+	current.AdminHostname = ""
+	current.AdminService = ""
+	if err := a.persistCloudflare(current); err != nil {
+		return err
 	}
 	if current.DNSRecordID == "" {
 		var created struct {
 			ID string `json:"id"`
 		}
-		body := map[string]any{"type": "CNAME", "name": "*.ddman.cc", "content": current.TunnelID + ".cfargotunnel.com", "proxied": true, "ttl": 1, "comment": "Managed by ddman-home-tunnel"}
+		body := map[string]any{"type": "CNAME", "name": wildcardHostname, "content": current.TunnelID + ".cfargotunnel.com", "proxied": true, "ttl": 1, "comment": "Managed by Wildcard Tunnel Manager"}
 		if err := client.request(http.MethodPost, "/zones/"+input.ZoneID+"/dns_records", body, &created); err != nil {
 			return fmt.Errorf("create wildcard DNS: %w", err)
 		}
@@ -264,8 +337,44 @@ func (a *App) configureCloudflare(client cfClient, input setupRequest) error {
 		if err := a.persistCloudflare(current); err != nil {
 			return err
 		}
+	} else if wildcardNeedsPatch {
+		if err := client.request(http.MethodPatch, "/zones/"+input.ZoneID+"/dns_records/"+current.DNSRecordID, map[string]any{"content": current.TunnelID + ".cfargotunnel.com", "proxied": true}, nil); err != nil {
+			return fmt.Errorf("transfer wildcard DNS: %w", err)
+		}
+	}
+	if input.Force && wildcardNeedsPatch {
+		var verify []struct {
+			Name    string `json:"name"`
+			Content string `json:"content"`
+		}
+		if err := client.request(http.MethodGet, "/zones/"+input.ZoneID+"/dns_records?name="+url.QueryEscape(wildcardHostname)+"&per_page=100", nil, &verify); err != nil {
+			return fmt.Errorf("verify transferred DNS: %w", err)
+		}
+		matched := false
+		for _, record := range verify {
+			if record.Name == wildcardHostname && record.Content == current.TunnelID+".cfargotunnel.com" {
+				matched = true
+			}
+		}
+		if !matched {
+			return errors.New("Cloudflare DNS transfer could not be verified; another host may have changed it")
+		}
 	}
 	return nil
+}
+
+func validTunnelDNSContent(content string) bool {
+	if !strings.HasSuffix(content, ".cfargotunnel.com") {
+		return false
+	}
+	return validTunnelID.MatchString(strings.TrimSuffix(content, ".cfargotunnel.com"))
+}
+
+func tunnelIngressConfig(wildcardHostname, socket string) map[string]any {
+	return map[string]any{"config": map[string]any{"ingress": []map[string]any{
+		{"hostname": wildcardHostname, "service": "unix:" + socket},
+		{"service": "http_status:404"},
+	}}}
 }
 
 func (a *App) persistCloudflare(value CloudflareConfig) error {

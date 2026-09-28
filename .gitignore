@@ -1,4 +1,6 @@
 config.json
 config.json.tmp
+.env
 ddman-home-tunnel
 tools/
+.DS_Store

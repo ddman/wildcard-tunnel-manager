@@ -1,51 +1,83 @@
-# DDMAN Home Tunnel
+# Wildcard Tunnel Manager
 
-在一台 Mac 上以本機網頁管理 `名稱.ddman.cc/路徑 → localhost:port`。Cloudflare Tunnel 只需一條，DNS 只需一筆 `*.ddman.cc` CNAME；已有明確 DNS 紀錄的名稱會由 Cloudflare DNS 優先處理，不會進入此 wildcard。
+**English** · [繁體中文](README.zh-TW.md)
 
-## 技術與路徑
+Manage `name.example.com/path → localhost:port` routes from a local web UI on macOS. Each host runs its own Cloudflare Tunnel. A proxied wildcard CNAME (`*.example.com`) can point to one host's tunnel at a time; explicit DNS records take precedence over the wildcard.
 
-```text
-瀏覽器 → Cloudflare DNS / Universal SSL → Cloudflare Tunnel
-       → cloudflared → 127.0.0.1:8788 → Go reverse proxy
-       → 127.0.0.1:<服務 port>
-```
+The domain is set with `DDMAN_BASE_DOMAIN` in `.env`. `example.com` is used only as an example below. The `DDMAN_` setting names and socket directory name remain for compatibility with earlier versions; they do not restrict the domain to `ddman.cc`.
 
-管理頁固定在 `http://127.0.0.1:8787`，不透過 Tunnel 公開。Go 程式負責管理頁、設定檔、HTTP/HTTPS origin 反向代理和 Cloudflare API。`cloudflared` 是唯一額外執行依賴。沒有前端建置流程，也不需要 Caddy 或 Docker。
+## Quick start
 
-## 啟動
-
-需要 Go 1.26+ 和 [cloudflared](https://developers.cloudflare.com/tunnel/get-started/)。目前這台 Mac 的專案內已有 `tools/cloudflared`（2026.9.3，Apple Silicon；已核對 GitHub release 資產 digest）。也可改用 `brew install cloudflared` 安裝到 PATH。
+You need macOS, Go 1.26+, `cloudflared`, a domain in Cloudflare, and permission to manage its tunnel and DNS records. Install [`cloudflared`](https://developers.cloudflare.com/tunnel/get-started/) (for example, `brew install cloudflared`), then:
 
 ```bash
-cd ~/projects/ddman-home-tunnel
+git clone https://github.com/ddman/wildcard-tunnel-manager.git
+cd wildcard-tunnel-manager
+cp .env.example .env
+chmod 600 .env
+# Edit .env: set DDMAN_BASE_DOMAIN, DDMAN_ADMIN_HOST, and a unique password of at least 16 characters.
 go run .
 ```
 
-開啟 `http://127.0.0.1:8787`，先新增 `app → http → 3000`。本機驗證：
+Open `http://127.0.0.1:8787`, sign in, and add a route such as `app → http → 3000`. To publish `app.example.com`, create a scoped API Token as described under [Cloudflare setup](#cloudflare-setup), enter the Account ID, Zone ID, and token in the UI, and select **Set up and connect**. This creates or reuses a tunnel and creates the `*.example.com` DNS record. If that wildcard already points to another tunnel, switching it requires the explicit force bind action.
 
-```bash
-curl -H 'Host: app.ddman.cc' http://127.0.0.1:8788/
+## How it works
+
+```text
+Browser → Cloudflare DNS / Universal SSL → Cloudflare Tunnel
+        → cloudflared → Unix socket → Go reverse proxy
+        → 127.0.0.1:<service port>
 ```
 
-同一個子網域可加入多條路徑路由。例如保留 `app.ddman.cc/ → http://127.0.0.1:3000`，再加入 `app.ddman.cc/api → http://127.0.0.1:4000`。最長的路徑前綴優先，且只在完整路徑區段邊界匹配：`/api/users` 符合 `/api`，`/apix` 不符合。預設保留路徑，所以上游收到 `/api/users`；勾選移除前綴後，上游收到 `/users`。舊設定中沒有 `path` 的路由仍代表 `/`。若上游網頁會輸出以 `/` 開頭的資源或導向，移除前綴可能需要另外設定該應用程式的 base path。
+The admin UI listens at `http://127.0.0.1:<DDMAN_ADMIN_PORT>` (8787 in the example). Set `DDMAN_ADMIN_TAILSCALE_IP` to also listen on that device's Tailscale IPv4 address. Browser login uses a time limited session cookie; the CLI can use HTTP Basic authentication. The admin UI and API are never published through the tunnel. Only allowed tailnet devices should reach the optional Tailscale listener.
 
-設定 Cloudflare 時，在 Dashboard 建立範圍最小的 API Token：Account / Cloudflare Tunnel / Edit，以及 `ddman.cc` 的 Zone / DNS / Edit（DNS Write）。注意「DNS 設定：編輯」（DNS Settings Edit）是不同權限，不能讀寫 DNS 紀錄。從 Dashboard 複製 Account ID 和 Zone ID。如果已在 Dashboard 建立空白的遠端管理 Tunnel，可把其 Tunnel ID 填入選填欄位；程式會先確認 Tunnel 沒有既有路由，再沿用它。否則會建立專用 Tunnel。設定流程檢查 wildcard DNS 是否已被占用、將 `*.ddman.cc` 設為 ingress、建立 proxied wildcard CNAME，最後啟動本機 `cloudflared`。若已有 `*.ddman.cc` DNS 紀錄且指向別處，設定會停止，並不覆蓋它。Dashboard 的安裝指令含 Tunnel token；使用本工具時無需執行。
+The proxy listens on `/tmp/ddman-home-tunnel-<uid>/<config-hash>.sock`, not a TCP port. The UI shows the exact path. Each config file gets its own socket. An older tunnel still configured for TCP may temporarily use `127.0.0.1:8788`; that listener closes after the tunnel is migrated to the socket. The Go process provides the UI, configuration, reverse proxy for HTTP/HTTPS origins, and Cloudflare API integration. `cloudflared` is its only additional runtime dependency; there is no frontend build, Caddy, or Docker requirement.
 
-設定保存在 `config.json`，包含 Tunnel token，檔案權限為 0600，且已加入 `.gitignore`。API Token 不會寫入磁碟。程式下次啟動會讀取 Tunnel token，重新啟動 `cloudflared`。請勿把 `config.json` 複製給其他人；持有 Tunnel token 的人可執行連線。
+## Configuration and routing
 
-## 範圍與限制
+Create `.env` from `.env.example` before the first run. Set `DDMAN_BASE_DOMAIN` to the Cloudflare zone you want to use, and set `DDMAN_ADMIN_HOST` to an unused single label under that domain (for example, `admin.example.com`). Also set `DDMAN_ADMIN_PORT`, `DDMAN_ADMIN_USERNAME`, and a unique `DDMAN_ADMIN_PASSWORD` of at least 16 characters. The host name reserves that label against public routes; it does not publish the admin UI. The file contains a plaintext password, must be owned by the current user with mode `0600`, and is ignored by Git. Account ID, Zone ID, and API Token can be entered in the UI or placed in `.env` as `CF_ACCOUNT_ID`, `CF_ZONE_ID`, and `CF_API_TOKEN` for binding checks at startup.
 
-- 目前只支援一台主機持有 `*.ddman.cc` wildcard。第二台若要提供不同服務，應改用每個服務各自的明確 DNS 紀錄與 Tunnel。
-- 只接受單層名稱，例如 `app.ddman.cc`，不處理 `app.home.ddman.cc`。後者的 HTTPS 需要額外憑證。
-- 路徑路由只支援固定前綴，未提供正規表示式、上游重新導向或回應內容改寫。
-- 公開網址預設沒有登入控管；知道網址的人都能使用服務。請勿掛上未設定認證的管理介面或含私密資料的服務。
-- origin 服務必須監聽本機回環位址；HTTPS origin 需有 Go 能驗證的有效憑證。瀏覽器到 Cloudflare 的 HTTPS 與 cloudflared 到本機的 HTTP 是不同連線。
-- `cloudflared` 與此 Go 程式需持續執行；Mac 睡眠或程式停止時服務不可用。目前未安裝 macOS 背景啟動服務。
-- 若 Cloudflare API 設定中途失敗，重新按「建立並連線」會沿用已儲存的 Tunnel 繼續；若需刪除 Tunnel 或 DNS，請在 Cloudflare Dashboard 處理。
+You can change the admin username and password from the **Admin credentials** page after entering the current password. Changes take effect immediately and are saved to `.env`. If you forget the password, edit `.env` on the host and restart the program; there is no unauthenticated remote reset.
 
-## 官方文件
+After adding a route, test the local proxy using the socket path displayed in the UI:
 
-- [Cloudflare Tunnel API setup](https://developers.cloudflare.com/tunnel/get-started/)
+```bash
+curl --unix-socket '<socket path shown in the UI>' http://app.example.com/
+```
+
+A hostname can have multiple path routes. For example, `app.example.com/` may go to `http://127.0.0.1:3000` while `app.example.com/api` goes to `http://127.0.0.1:4000`. The longest path prefix wins, and matches only at segment boundaries: `/api/users` matches `/api`, but `/apix` does not. The prefix is kept by default, so the origin sees `/api/users`; with **Strip prefix**, it sees `/users`. Older routes without a `path` still represent `/`. Applications using root-relative assets or redirects may need their own base path configured when stripping prefixes.
+
+### Cloudflare setup
+
+In Cloudflare Dashboard, create a scoped API Token with **Account → Cloudflare Tunnel → Edit** and **Zone → DNS → Edit** for the chosen domain. DNS Settings Edit is a different permission and cannot manage DNS records. Copy the Account ID and Zone ID from Dashboard. You may supply the ID of an empty remotely managed tunnel; the tool verifies that it has no existing ingress before reusing it. Otherwise, it creates a dedicated tunnel.
+
+The tool configures `*.example.com` ingress to the local Unix socket, creates a proxied wildcard CNAME, and starts `cloudflared`. It does not create admin ingress or an admin DNS record. A normal bind reports a conflict if the wildcard points to another tunnel. Only **Force bind** changes that record to this host's tunnel. You do not need to run the Cloudflare Dashboard installation command, which contains a tunnel token.
+
+If upgrading a tunnel that used the old `8788` TCP listener, enter the API Token again in the UI and select **Set up and connect**. This updates the existing tunnel's origin address while retaining its tunnel and DNS record. The CLI can perform the same migration while the admin process is running. It reads stored Account ID, Zone ID, and Tunnel ID from the local admin API; the API Token comes through standard input, not a command argument:
+
+```bash
+read -s "CF_API_TOKEN?Cloudflare API Token: "
+printf '%s' "$CF_API_TOKEN" | go run . tunnel use-socket --token-stdin
+unset CF_API_TOKEN
+```
+
+`config.json` contains the tunnel token and uses mode `0600`. `.env` stores the API Token, Account ID, and Zone ID for periodic binding checks and also uses mode `0600`. Both files are ignored by Git. Never share them. A tunnel token can connect to the tunnel; it cannot query or edit published hostnames. On restart, the program uses the stored tunnel token to start `cloudflared` again.
+
+## Multiple hosts and limitations
+
+- Each host has its own tunnel and `config.json`. The wildcard CNAME points to one tunnel at a time. A force bind switches DNS but does not stop the old host remotely. Explicit DNS records are unaffected.
+- The UI checks the wildcard DNS every 30 seconds. A normal bind does not overwrite a conflict; **Force bind** switches the CNAME and verifies it. **Unbind** removes the wildcard record only if it still points to this host's tunnel, and does not delete the tunnel. Existing connections may briefly remain on the previous host.
+- Only one level of subdomain is routed: `app.example.com`, not `app.home.example.com`. The latter also needs separate HTTPS certificate coverage.
+- Path routes use fixed prefixes, without regular expressions, upstream redirect rewriting, or response body rewriting.
+- Public routes have no built in access control. Do not publish an unauthenticated admin UI or private service.
+- Origins must listen on loopback. HTTPS origins need a certificate Go can verify. Browser to Cloudflare HTTPS and cloudflared to the local HTTP socket are separate connections. `cloudflared` must be able to access the socket; this tool starts it as the same user.
+- Both this process and `cloudflared` must keep running. Services are unavailable while the Mac sleeps or the process stops. No macOS background service is installed.
+- If setup fails partway through, retrying **Set up and connect** reuses the saved tunnel. Delete a tunnel or DNS record manually in Cloudflare Dashboard if needed.
+- To simulate two instances on one computer, use separate config directories and different `DDMAN_ADMIN_PORT` values. Automated tests mock the Cloudflare API.
+
+## References
+
+- [Cloudflare Tunnel setup](https://developers.cloudflare.com/tunnel/get-started/)
 - [Wildcard DNS priority](https://developers.cloudflare.com/dns/manage-dns-records/reference/wildcard-dns-records/)
 - [Universal SSL coverage](https://developers.cloudflare.com/ssl/edge-certificates/universal-ssl/)
 - [Tunnel run parameters](https://developers.cloudflare.com/tunnel/reference/run-parameters/)
